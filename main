@@ -1,0 +1,675 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+#include <stdint.h>  //Exact-width integer types
+#include <ti\devices\msp432p4xx\driverlib\driverlib.h>  // Driver library
+
+//Definitions
+#define CLOCK_HF    48000000 //48MHz
+#define CLOCK_LF    32000 //32kHz
+#define HEARTBEAT_FREQ    1  //unit: Hz, heart beat LED blinking frequency for debugging
+#define RED_LED    GPIO_PIN0  //heart beat LED
+#define GREEN_LED    GPIO_PIN1
+#define BLUE_LED    GPIO_PIN2
+#define NUM_DISP_TEXT_LINE    5
+#define MAX_STR_BUFFER_LEN    200
+#define PWM_FREQ    1000 //unit: Hz
+#define PWM_DUTYCYCLE_MIN    0 //unit: percent
+#define PWM_DUTYCYCLE_MAX    100 //unit: percent
+#define PWM_DUTYCYCLE_STEP    5 //unit: percent
+#define LEFT_MOTOR    0
+#define RIGHT_MOTOR    1
+#define MOTOR_FORWARD    1
+#define MOTOR_STOP    0
+#define MOTOR_BACKWARD    -1
+#define DCO_FREQ 48e6
+#define TIMER0_FREQ 1
+#define SAMPLE_FREQ 1
+
+//Function Prototypes
+void initDevice_HFXT(void);
+void initHeartBeatLED(void);
+void initDebugUART(void);
+void initMotors(void);
+void leftMotor_activate(int flag);
+void rightMotor_activate(int flag);
+void leftMotor_run(int direction, int dutyCycle);
+void rightMotor_run(int direction, int dutyCycle);
+void initTachometers(void);
+void moveForward(void);
+void initGPIO(void);
+void initTimer(void);
+void initADC14(void);
+void ADC14_IRQHandler(void);
+
+//Movement Prototypes
+void forward(void);
+void reverse(void);
+void turnLeft(void);
+void turnRight(void);
+void stop(void);
+
+//Variables
+float tacho_calcSpeed(int timerCount);
+void uart0_transmitStr(const char *str);
+
+//Global Variables
+uint32_t clockMCLK, clockSMCLK, clockACLK;
+uint8_t currentLED = RED_LED;
+int currentMotor = LEFT_MOTOR;
+int leftMotor_dutyCycle = PWM_DUTYCYCLE_MIN;
+int leftMotor_direction = MOTOR_FORWARD;
+volatile int leftTacho_timerCount = 0;
+volatile int leftTacho_direction = MOTOR_FORWARD;
+int rightMotor_dutyCycle = PWM_DUTYCYCLE_MIN;
+int rightMotor_direction = MOTOR_FORWARD;
+volatile int rightTacho_timerCount = 0;
+volatile int rightTacho_direction = MOTOR_FORWARD;
+volatile uint32_t tempSensorCal30, tempSensorCal85, tempSensorCalDiff;
+int globalPWM = PWM_DUTYCYCLE_MIN;
+bool motionStart = false;
+bool flagLife = false;
+
+char strBuffer[MAX_STR_BUFFER_LEN];
+
+const char *terminalDisplayText[NUM_DISP_TEXT_LINE] =
+{
+    "\r\n",
+    "The Rescue Rat\r\n",
+    "  W: Forward, A: Counterclockwise Turn, S: Stop, D: Clockwise Turn, X: Reverse\r\n",
+    "  L: Sense Life, H: Help\r\n",
+    "> "
+};
+
+void main()
+{
+    int i;//, direction;
+    uint8_t data;
+
+
+    initDevice_HFXT();
+    initHeartBeatLED();//This will be utilized to time the software ADC14 conversion call.
+    initDebugUART();
+    initMotors();
+    initTachometers();
+    initGPIO();
+    initTimer();
+    initADC14();
+
+    Interrupt_enableMaster();
+
+
+
+    //Start timer for tachometer speed measurement.
+    Timer_A_startCounter(TIMER_A3_BASE, TIMER_A_CONTINUOUS_MODE);
+
+    //Initial display on terminal.
+    for(i=0; i<NUM_DISP_TEXT_LINE; i++)
+    {
+        uart0_transmitStr(terminalDisplayText[i]);
+    }
+
+    Timer32_startTimer(TIMER32_0_BASE, false);
+
+    while(1)
+    {
+        if(UART_getInterruptStatus(EUSCI_A0_BASE, EUSCI_A_UART_RECEIVE_INTERRUPT_FLAG))
+        {
+            data = UART_receiveData(EUSCI_A0_BASE);
+            UART_clearInterruptFlag(EUSCI_A0_BASE, EUSCI_A_UART_RECEIVE_INTERRUPT_FLAG);
+
+            switch(data)
+            {
+                case 'S':
+                case 's'://Stops both motors
+                    stop();
+                    uart0_transmitStr("-Motors Stopped.\r\n> ");
+                    break;
+                case 'W':
+                case 'w'://Go straight
+                    forward();
+                    uart0_transmitStr("-Forward.\r\n> ");
+                    break;
+                case 'X':
+                case 'x'://Go backwards
+                    reverse();
+                    uart0_transmitStr("-Reverse.\r\n> ");
+                    break;
+                case 'A':
+                case 'a'://CC turn, left.
+                    turnLeft();
+                    uart0_transmitStr("-Rotate Left.\r\n> ");
+                    break;
+                case 'D':
+                case 'd'://CW turn, right
+                    turnRight();
+                    uart0_transmitStr("-Rotate Right.\r\n> ");
+                    break;
+                case 'H':
+                case 'h'://Display help text
+                    for(i=0; i<NUM_DISP_TEXT_LINE; i++)
+                    {
+                        uart0_transmitStr(terminalDisplayText[i]);
+                    }
+                    break;
+                case 'L':
+                case 'l'://Detect Life
+                    if(flagLife)
+                      {
+                        flagLife = false;
+                        motionStart = false;
+
+                      }
+                    else
+                      {
+                           flagLife = true;
+                           stop();
+                           motionStart = true;
+                      }
+                      break;
+
+          } //end of switch
+        } //end of if
+    } //end of while
+}
+
+//Movement Functions
+void forward(void)
+{
+    leftMotor_run(MOTOR_FORWARD, 10);
+    rightMotor_run(MOTOR_FORWARD, 10);
+}
+
+void reverse(void)
+{
+    leftMotor_run(MOTOR_BACKWARD, 10);
+    rightMotor_run(MOTOR_BACKWARD, 10);
+}
+
+void turnLeft(void)
+{
+    leftMotor_run(MOTOR_BACKWARD, 8);
+    rightMotor_run(MOTOR_FORWARD, 8);
+}
+
+void turnRight(void)
+{
+    leftMotor_run(MOTOR_FORWARD, 8);
+    rightMotor_run(MOTOR_BACKWARD, 8);
+}
+
+void stop(void)
+{
+    leftMotor_run(leftMotor_direction, 0);
+    rightMotor_run(rightMotor_direction, 0);
+}
+
+void initTimer(void)
+{
+    Timer32_initModule(TIMER32_0_BASE, TIMER32_PRESCALER_1, TIMER32_32BIT, TIMER32_PERIODIC_MODE);
+    Timer32_setCount(TIMER32_0_BASE, clockMCLK/TIMER0_FREQ);
+    Timer32_enableInterrupt(TIMER32_0_BASE);
+    Interrupt_enableInterrupt(INT_T32_INT1); //Enable Timer32_0 interrupt in the interrupt controller.
+
+}
+
+void initADC14(void)
+{
+    //Enabling Module
+    ADC14_enableModule();
+    ADC14_initModule(ADC_CLOCKSOURCE_SMCLK, ADC_PREDIVIDER_1, ADC_DIVIDER_1, ADC_TEMPSENSEMAP);
+    //Setting Input GPIO
+    GPIO_setAsPeripheralModuleFunctionInputPin(GPIO_PORT_P6, GPIO_PIN1, GPIO_TERTIARY_MODULE_FUNCTION);//Moisture
+    GPIO_setAsPeripheralModuleFunctionInputPin(GPIO_PORT_P4, GPIO_PIN0, GPIO_TERTIARY_MODULE_FUNCTION);//PIR Motion
+    //Configuring ADC Memory - read from multiple pins, write to multiple locations
+    ADC14_configureMultiSequenceMode(ADC_MEM0, ADC_MEM2, false);
+    //A22 - Temperature
+    ADC14_configureConversionMemory(ADC_MEM0, ADC_VREFPOS_INTBUF_VREFNEG_VSS, ADC_INPUT_A22, false);
+    //A14 - Moisture
+    ADC14_configureConversionMemory(ADC_MEM1, ADC_VREFPOS_INTBUF_VREFNEG_VSS, ADC_INPUT_A14, ADC_NONDIFFERENTIAL_INPUTS);
+    //A13 - PIR Motion
+    ADC14_configureConversionMemory(ADC_MEM2, ADC_VREFPOS_INTBUF_VREFNEG_VSS, ADC_INPUT_A13, ADC_NONDIFFERENTIAL_INPUTS);
+    //Ultrasonic sensing is not data depending, rather it is time dependent.
+
+    ADC14_enableInterrupt(ADC_INT0 | ADC_INT1 | ADC_INT2); //Mem0 Stores -> Int0 Interrupt triggered.
+
+    //Enable Interrupts
+    Interrupt_enableInterrupt(INT_ADC14);
+    Interrupt_enableMaster();
+    //Enable Timer Sample
+    ADC14_enableSampleTimer(ADC_AUTOMATIC_ITERATION);
+    ADC14_setSampleHoldTrigger(ADC_TRIGGER_ADCSC, false); // Now triggered with Software Call.
+    ADC14_setSampleHoldTime(ADC_PULSE_WIDTH_4, ADC_PULSE_WIDTH_4);
+    //Trigger Start of Sampling
+    ADC14_enableConversion();
+
+    //Set VREF to 2.5 and enable internal temperature sensor.
+    REF_A_enableTempSensor();
+    REF_A_setReferenceVoltage(REF_A_VREF2_5V);
+    REF_A_enableReferenceVoltage();
+
+    //Get temperature sensor calibration data.
+    tempSensorCal30 = SysCtl_getTempCalibrationConstant(SYSCTL_2_5V_REF, SYSCTL_30_DEGREES_C);
+    tempSensorCal85 = SysCtl_getTempCalibrationConstant(SYSCTL_2_5V_REF, SYSCTL_85_DEGREES_C);
+    tempSensorCalDiff = tempSensorCal85 - tempSensorCal30;
+
+
+}
+
+void ADC14_IRQHandler(void)
+{
+    uint64_t status;
+    uint16_t resultsBuffer[3];
+    int moistureData;
+    float tempData, tempC;
+    int motionData;
+    status = ADC14_getEnabledInterruptStatus();
+    ADC14_clearInterruptFlag(status);
+
+    if(status & ADC_INT2)
+    {
+        ADC14_getMultiSequenceResult(resultsBuffer);
+        tempData = resultsBuffer[0];
+        tempData=(tempData - tempSensorCal30)*55;
+        tempC = (tempData / tempSensorCalDiff) +30;//Conversion to degC
+        motionData = resultsBuffer[2];
+        moistureData = resultsBuffer[1];
+
+        snprintf(strBuffer, MAX_STR_BUFFER_LEN, "Temperature (C): %.1f\r\n, Moisture: %.1i\r\n, Motion: %.1i\r\n", tempC, moistureData, motionData);
+        uart0_transmitStr(strBuffer);
+
+        //If things go wrong, light LED
+            if(tempC > 85.0)
+            {
+                GPIO_setOutputHighOnPin(GPIO_PORT_P4, GPIO_PIN2);// Light notification LED.
+                uart0_transmitStr("!!!! Temp. Too High, Rectify. !!!!\r\n> ");
+
+            }
+            else
+            {
+                GPIO_setOutputLowOnPin(GPIO_PORT_P4, GPIO_PIN2);
+            }
+            if(moistureData > 250)
+            {
+                GPIO_setOutputHighOnPin(GPIO_PORT_P4, GPIO_PIN2);// Light notification LED.
+                uart0_transmitStr("!!!! Driven Into Moisture !!!!\r\n> ");
+            }
+            else
+            {
+                GPIO_setOutputLowOnPin(GPIO_PORT_P4, GPIO_PIN2);
+            }
+            if(motionStart == true && motionData > 5000 )
+            {
+
+                    GPIO_setOutputHighOnPin(GPIO_PORT_P4, GPIO_PIN2);// Light notification LED.
+                    uart0_transmitStr("!!!! Movement Detected - Investigate !!!!\r\n> ");
+            }
+            else
+            {
+                GPIO_setOutputLowOnPin(GPIO_PORT_P4, GPIO_PIN2);
+            }
+
+    }
+
+
+
+
+
+
+}
+
+void initGPIO(void)
+{
+    GPIO_setAsOutputPin(GPIO_PORT_P4, GPIO_PIN2);// Hazard/Warning LED - GPIO
+    //GPIO_setAsInputPin(GPIO_PORT_P4, GPIO_PIN0);//PIR Sensor Data pin (2 second read time) - A13
+    //GPIO_setAsPeripheralModuleFunctionInputPin(GPIO_PORT_P6, GPIO_PIN1, GPIO_TERTIARY_MODULE_FUNCTION);//Analog moisture sensor (instant) - A14
+    GPIO_setAsOutputPin(GPIO_PORT_P3, GPIO_PIN2);//Trigger for ultrasonic sensor, output pulse. - GPIO
+    GPIO_setAsInputPin(GPIO_PORT_P3, GPIO_PIN3);//Echo for ultrasonic sensor, input echo data. - GPIO
+}
+
+void initDevice_HFXT(void)
+{
+    WDT_A_holdTimer();  //Stop watchdog timer.
+
+    //Change VCORE to 1 to support a frequency higher than 24MHz.
+    //See MSP432 Data Sheet, Section 5.8 for Flash wait-state requirements for active frequency.
+    PCM_setPowerState(PCM_AM_DCDC_VCORE1);
+    FlashCtl_setWaitState(FLASH_BANK0, 1);
+    FlashCtl_setWaitState(FLASH_BANK1, 1);
+
+    FPU_enableModule();
+    FPU_enableLazyStacking(); //Required to use FPU within ISR.
+
+    //Configure PJ.2 and PJ.3 in HFXT mode.
+    //Initialize external clock sources HFXT.
+    GPIO_setAsPeripheralModuleFunctionOutputPin(GPIO_PORT_PJ, GPIO_PIN2|GPIO_PIN3, GPIO_PRIMARY_MODULE_FUNCTION);
+    CS_setExternalClockSourceFrequency(CLOCK_LF, CLOCK_HF);
+    CS_startHFXT(false);
+
+    CS_initClockSignal(CS_MCLK, CS_HFXTCLK_SELECT, CS_CLOCK_DIVIDER_1);
+    CS_initClockSignal(CS_HSMCLK, CS_HFXTCLK_SELECT, CS_CLOCK_DIVIDER_8);
+    CS_initClockSignal(CS_SMCLK, CS_HFXTCLK_SELECT, CS_CLOCK_DIVIDER_16);
+    CS_initClockSignal(CS_ACLK, CS_REFOCLK_SELECT, CS_CLOCK_DIVIDER_1); //32kHz
+
+    clockMCLK = CS_getMCLK();
+    clockSMCLK = CS_getSMCLK();
+    clockACLK = CS_getACLK();
+}
+
+void initHeartBeatLED(void)
+{
+    //Configure P2.0, P2.1, P2.2 as output.
+    //P2.0, P2.1, P2.2 are connected to a RGB tri-color LED on LaunchPad.
+    GPIO_setAsOutputPin(GPIO_PORT_P2, GPIO_PIN0|GPIO_PIN1|GPIO_PIN2);
+
+    Timer32_initModule(TIMER32_0_BASE, TIMER32_PRESCALER_1, TIMER32_32BIT, TIMER32_PERIODIC_MODE);
+    Timer32_setCount(TIMER32_0_BASE, clockMCLK/HEARTBEAT_FREQ);
+    Timer32_enableInterrupt(TIMER32_0_BASE);
+    Interrupt_enableInterrupt(INT_T32_INT1); // Enable Timer32_0 interrupt in the interrupt controller.
+}
+
+void initDebugUART(void)
+{
+    // Configuration for 3MHz SMCLK, 9600 baud rate.
+    // Calculated using the online calculator that TI provides at:
+    // http://software-dl.ti.com/msp430/msp430_public_sw/mcu/msp430/MSP430BaudRateConverter/index.html
+    const eUSCI_UART_ConfigV1 config =
+    {
+        EUSCI_A_UART_CLOCKSOURCE_SMCLK, //SMCLK Clock Source
+        19, //BRDIV = 19
+        8, //UCxBRF = 8
+        0, //UCxBRS = 0
+        EUSCI_A_UART_NO_PARITY, //No Parity
+        EUSCI_A_UART_LSB_FIRST, //MSB First
+        EUSCI_A_UART_ONE_STOP_BIT, //One stop bit
+        EUSCI_A_UART_MODE, //UART mode
+        EUSCI_A_UART_OVERSAMPLING_BAUDRATE_GENERATION //Oversampling
+    };
+
+    //Configure GPIO pins for UART. RX: P1.2, TX:P1.3.
+    GPIO_setAsPeripheralModuleFunctionInputPin(GPIO_PORT_P1, GPIO_PIN2|GPIO_PIN3, GPIO_PRIMARY_MODULE_FUNCTION);
+
+    UART_initModule(EUSCI_A0_BASE, &config);
+    UART_enableModule(EUSCI_A0_BASE);
+}
+
+void initMotors(void)
+{
+    Timer_A_PWMConfig leftMotor_pwmConfig =
+    {
+            TIMER_A_CLOCKSOURCE_SMCLK,
+            TIMER_A_CLOCKSOURCE_DIVIDER_3,
+            clockSMCLK/(3*PWM_FREQ),
+            TIMER_A_CAPTURECOMPARE_REGISTER_4,
+            TIMER_A_OUTPUTMODE_RESET_SET,
+            clockSMCLK/(3*PWM_FREQ)/100*leftMotor_dutyCycle
+    };
+
+    Timer_A_PWMConfig rightMotor_pwmConfig =
+    {
+            TIMER_A_CLOCKSOURCE_SMCLK,
+            TIMER_A_CLOCKSOURCE_DIVIDER_3,
+            clockSMCLK/(3*PWM_FREQ),
+            TIMER_A_CAPTURECOMPARE_REGISTER_3,
+            TIMER_A_OUTPUTMODE_RESET_SET,
+            clockSMCLK/(3*PWM_FREQ)/100*rightMotor_dutyCycle
+    };
+
+    //P3.7: 1 to activate left motor;
+    //P3.6: 1 to activate right motor
+    GPIO_setAsOutputPin(GPIO_PORT_P3, GPIO_PIN6|GPIO_PIN7);
+
+    GPIO_setOutputHighOnPin(GPIO_PORT_P3, GPIO_PIN6);
+    GPIO_setOutputHighOnPin(GPIO_PORT_P3, GPIO_PIN7);
+
+    //P5.4: left motor, 0 for forward, 1 for backward;
+    //P5.5: right motor, 0 for forward, 1 for backward
+    GPIO_setAsOutputPin(GPIO_PORT_P5, GPIO_PIN4|GPIO_PIN5);
+
+    GPIO_setOutputLowOnPin(GPIO_PORT_P5, GPIO_PIN4);
+    GPIO_setOutputLowOnPin(GPIO_PORT_P5, GPIO_PIN5);
+
+    //P2.7/TA0.4: left motor PWM;
+    //P2.6/TA0.3: right motor PWM
+    GPIO_setAsPeripheralModuleFunctionOutputPin(GPIO_PORT_P2, GPIO_PIN7, GPIO_PRIMARY_MODULE_FUNCTION);
+    GPIO_setAsPeripheralModuleFunctionOutputPin(GPIO_PORT_P2, GPIO_PIN6, GPIO_PRIMARY_MODULE_FUNCTION);
+
+    Timer_A_generatePWM(TIMER_A0_BASE, &leftMotor_pwmConfig);
+    Timer_A_generatePWM(TIMER_A0_BASE, &rightMotor_pwmConfig);
+}
+
+//flag = 1 to activate, 0 to sleep
+void leftMotor_activate(int flag)
+{
+    if(flag)
+    {
+        GPIO_setOutputHighOnPin(GPIO_PORT_P3, GPIO_PIN7);
+    }
+    else
+    {
+        GPIO_setOutputLowOnPin(GPIO_PORT_P3, GPIO_PIN7);
+    }
+}
+
+
+//flag = 1 to activate, 0 to sleep
+void rightMotor_activate(int flag)
+{
+    if(flag)
+    {
+        GPIO_setOutputHighOnPin(GPIO_PORT_P3, GPIO_PIN6);
+    }
+    else
+    {
+        GPIO_setOutputLowOnPin(GPIO_PORT_P3, GPIO_PIN6);
+    }
+}
+
+
+void leftMotor_run(int direction, int dutyCycle)
+{
+    if(leftMotor_direction != direction)
+    {
+        leftMotor_direction = direction;
+        if(direction == MOTOR_FORWARD)
+            GPIO_setOutputLowOnPin(GPIO_PORT_P5, GPIO_PIN4);
+        else
+            GPIO_setOutputHighOnPin(GPIO_PORT_P5, GPIO_PIN4);
+    }
+
+    if(dutyCycle > PWM_DUTYCYCLE_MAX)
+    {
+        dutyCycle = PWM_DUTYCYCLE_MAX;
+    }
+
+    if(dutyCycle < PWM_DUTYCYCLE_MIN)
+    {
+        dutyCycle = PWM_DUTYCYCLE_MIN;
+    }
+
+    if(leftMotor_dutyCycle != dutyCycle)
+    {
+        leftMotor_dutyCycle = dutyCycle;
+        Timer_A_setCompareValue(TIMER_A0_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_4, clockSMCLK/(3*PWM_FREQ)/100*leftMotor_dutyCycle);
+    }
+}
+
+
+void rightMotor_run(int direction, int dutyCycle)
+{
+    if(rightMotor_direction != direction)
+    {
+        rightMotor_direction = direction;
+        if(direction  == MOTOR_FORWARD)
+            GPIO_setOutputLowOnPin(GPIO_PORT_P5, GPIO_PIN5);
+        else
+            GPIO_setOutputHighOnPin(GPIO_PORT_P5, GPIO_PIN5);
+    }
+
+    if(dutyCycle > PWM_DUTYCYCLE_MAX)
+    {
+        dutyCycle = PWM_DUTYCYCLE_MAX;
+    }
+
+    if(dutyCycle < PWM_DUTYCYCLE_MIN)
+    {
+        dutyCycle = PWM_DUTYCYCLE_MIN;
+    }
+
+    if(rightMotor_dutyCycle != dutyCycle)
+    {
+        rightMotor_dutyCycle = dutyCycle;
+        Timer_A_setCompareValue(TIMER_A0_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_3, clockSMCLK/(3*PWM_FREQ)/100*rightMotor_dutyCycle);
+    }
+}
+
+float tacho_calcSpeed(int timerCount)
+{
+    //pulsePeriod = timerCount/timerClockFreq
+    //speed (RPM) = 60/(360*pulsePeriod)
+    //Hard-coded for Timer_A frequency 3MHz/6 = 600kHz.
+    return 100000.0/timerCount;
+}
+
+//Transmit a string through UART0.
+void uart0_transmitStr(const char *str)
+{
+    int len, i=0;
+
+    len = strlen(str);
+    while(i < len)
+    {
+        UART_transmitData(EUSCI_A0_BASE, str[i++]);
+        while(!UART_getInterruptStatus(EUSCI_A0_BASE, EUSCI_A_UART_TRANSMIT_COMPLETE_INTERRUPT_FLAG));
+        UART_clearInterruptFlag(EUSCI_A0_BASE, EUSCI_A_UART_TRANSMIT_COMPLETE_INTERRUPT_FLAG);
+    }
+}
+
+//Timer32_0 ISR - Will trigger software based ADC conversion call.
+void T32_INT1_IRQHandler(void)
+{
+    Timer32_clearInterruptFlag(TIMER32_0_BASE);
+
+    if(ADC14_toggleConversionTrigger() == true)
+    {
+        if(GPIO_getInputPinValue(GPIO_PORT_P2, RED_LED|GREEN_LED|BLUE_LED))
+            {
+                GPIO_setOutputLowOnPin(GPIO_PORT_P2, RED_LED|GREEN_LED|BLUE_LED);
+            }
+            else
+            {
+                GPIO_setOutputHighOnPin(GPIO_PORT_P2, currentLED);
+            }
+    }
+
+    //ADC14_toggleConversionTrigger();//This triggers the ADC to start conversion
+
+}
+
+void initTachometers(void)
+{
+    Timer_A_ContinuousModeConfig Timer_A_config =
+    {
+            TIMER_A_CLOCKSOURCE_SMCLK,  //3MHz
+            TIMER_A_CLOCKSOURCE_DIVIDER_5,  //600kHz
+            TIMER_A_TAIE_INTERRUPT_DISABLE,
+            TIMER_A_DO_CLEAR
+    };
+
+    Timer_A_CaptureModeConfig leftTacho_captureConfig =
+    {
+            TIMER_A_CAPTURECOMPARE_REGISTER_1,
+            TIMER_A_CAPTUREMODE_RISING_EDGE,
+            TIMER_A_CAPTURE_INPUTSELECT_CCIxA,
+            TIMER_A_CAPTURE_SYNCHRONOUS,
+            TIMER_A_CAPTURECOMPARE_INTERRUPT_ENABLE,
+            TIMER_A_OUTPUTMODE_OUTBITVALUE
+    };
+
+
+    Timer_A_CaptureModeConfig rightTacho_captureConfig =
+    {
+            TIMER_A_CAPTURECOMPARE_REGISTER_0,
+            TIMER_A_CAPTUREMODE_RISING_EDGE,
+            TIMER_A_CAPTURE_INPUTSELECT_CCIxA,
+            TIMER_A_CAPTURE_SYNCHRONOUS,
+            TIMER_A_CAPTURECOMPARE_INTERRUPT_ENABLE,
+            TIMER_A_OUTPUTMODE_OUTBITVALUE
+    };
+
+    Timer_A_configureContinuousMode(TIMER_A3_BASE, &Timer_A_config);
+
+    //P10.5/TA3.1: left tachometer
+    //P10.4/TA3.0: right tachometer
+    GPIO_setAsPeripheralModuleFunctionInputPin(GPIO_PORT_P10, GPIO_PIN5, GPIO_PRIMARY_MODULE_FUNCTION);
+    GPIO_setAsPeripheralModuleFunctionInputPin(GPIO_PORT_P10, GPIO_PIN4, GPIO_PRIMARY_MODULE_FUNCTION);
+
+    //TA3.1: left tachometer pulse period (i.e., speed) measurement
+    //TA3.0: right tachometer pulse period (i.e., speed) measurement
+    Timer_A_initCapture(TIMER_A3_BASE, &leftTacho_captureConfig);
+    Timer_A_initCapture(TIMER_A3_BASE, &rightTacho_captureConfig);
+
+    //P5.2: left tachometer direction
+    //P5.0: right tachometer direction
+    GPIO_setAsInputPin(GPIO_PORT_P5, GPIO_PIN0|GPIO_PIN2);
+
+    Interrupt_enableInterrupt(INT_TA3_0);
+    Interrupt_enableInterrupt(INT_TA3_N);
+}
+
+//Left tachometer pulse period measurement
+void TA3_N_IRQHandler(void)
+{
+    static uint_fast16_t lastCount = 0, currentCount = 0;
+
+    Timer_A_clearCaptureCompareInterrupt(TIMER_A3_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_1);
+
+    currentCount = Timer_A_getCaptureCompareCount(TIMER_A3_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_1);
+
+    leftTacho_timerCount = currentCount - lastCount;
+    if(leftTacho_timerCount < 0)
+    {
+        leftTacho_timerCount += 0xFFFF;
+    }
+
+    lastCount = currentCount;
+
+    //P5.2: 1 for forward, 0 for backward
+    if(GPIO_getInputPinValue(GPIO_PORT_P5, GPIO_PIN2))
+    {
+        leftTacho_direction = MOTOR_FORWARD;
+    }
+    else
+    {
+        leftTacho_direction = MOTOR_BACKWARD;
+    }
+}
+
+
+//Right tachometer pulse period measurement
+void TA3_0_IRQHandler(void)
+{
+    static uint_fast16_t lastCount = 0, currentCount = 0;
+
+    Timer_A_clearCaptureCompareInterrupt(TIMER_A3_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_0);
+
+    currentCount = Timer_A_getCaptureCompareCount(TIMER_A3_BASE, TIMER_A_CAPTURECOMPARE_REGISTER_0);
+
+    rightTacho_timerCount = currentCount - lastCount;
+    if(rightTacho_timerCount < 0)
+    {
+        rightTacho_timerCount += 0xFFFF;
+    }
+
+    lastCount = currentCount;
+
+    //P5.0: 1 for forward, 0 for backward
+    if(GPIO_getInputPinValue(GPIO_PORT_P5, GPIO_PIN0))
+    {
+        rightTacho_direction = MOTOR_FORWARD;
+    }
+    else
+    {
+        rightTacho_direction = MOTOR_BACKWARD;
+    }
+}
